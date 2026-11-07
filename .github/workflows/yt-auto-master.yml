@@ -1,4 +1,4 @@
-name: YT Auto Master Pipeline — Local Workspace Only
+name: YT Auto Master Pipeline — Drive Input + Local Processing
 
 on:
   workflow_dispatch:
@@ -26,13 +26,16 @@ jobs:
     timeout-minutes: 350
 
     env:
-      # These flags tell compatible notebook code to avoid external storage.
+      # These flags disable Google report/sheet/upload integrations; source folders are fetched by the workflow step above.
       LOCAL_ONLY_MODE: "1"
       DISABLE_CLOUD_STORAGE: "1"
       DISABLE_GOOGLE_INTEGRATIONS: "1"
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # Public Google Drive folder links stored as GitHub Actions secrets.
+      DRIVE_ASSETS_URL: ${{ secrets.DRIVE_ASSETS_URL }}
+      DRIVE_DOWNLOAD_URL: ${{ secrets.DRIVE_DOWNLOAD_URL }}
       MAX_PARALLEL_VIDEOS: ${{ inputs.max_parallel_videos }}
       SCHEDULE_TIMEZONE: Asia/Karachi
       PYTHONUNBUFFERED: "1"
@@ -65,21 +68,78 @@ jobs:
           ffprobe -version | head -n 1
           df -h "$GITHUB_WORKSPACE"
 
-      - name: Prepare local workspace
+      - name: Prepare clean workspace
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Preserve repository-provided input files in download/ and assets/.
+          rm -rf download assets clips "Ready_!" Part_4_Output executed logs local_notebooks run_manifest.json
           mkdir -p download assets clips "Ready_!" Part_4_Output executed logs local_notebooks
-          rm -rf clips/* "Ready_!"/* Part_4_Output/* executed/* logs/* local_notebooks/* run_manifest.json
-          printf 'Local-only pipeline started at %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > logs/pipeline.log
+          printf 'Pipeline started at %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > logs/pipeline.log
 
-          input_count=$(find download -type f | wc -l)
-          echo "Files already present in download/: $input_count"
-          if [[ "$input_count" -eq 0 ]]; then
-            echo "::error::No input files found in download/. Add your source files to the repository under download/ before running this workflow. This workflow does not download from Google Drive or another cloud service."
+      - name: Install Google Drive folder downloader
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --disable-pip-version-check 'gdown>=5.2,<6'
+
+      - name: Download public Drive folders (assets and download)
+        id: drive_download
+        shell: bash
+        env:
+          DRIVE_ASSETS_URL: ${{ secrets.DRIVE_ASSETS_URL }}
+          DRIVE_DOWNLOAD_URL: ${{ secrets.DRIVE_DOWNLOAD_URL }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "${DRIVE_ASSETS_URL:-}" ]]; then
+            echo "::error::Missing GitHub Secret DRIVE_ASSETS_URL (publicly shared assets folder link)."
             exit 1
           fi
+          if [[ -z "${DRIVE_DOWNLOAD_URL:-}" ]]; then
+            echo "::error::Missing GitHub Secret DRIVE_DOWNLOAD_URL (publicly shared source-video folder link)."
+            exit 1
+          fi
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import gdown
+
+          folders = [
+              ("assets", os.environ["DRIVE_ASSETS_URL"]),
+              ("download", os.environ["DRIVE_DOWNLOAD_URL"]),
+          ]
+          for folder_name, url in folders:
+              target = Path(folder_name)
+              target.mkdir(parents=True, exist_ok=True)
+              print(f"Downloading Google Drive folder: {folder_name}/")
+              result = gdown.download_folder(
+                  url=url,
+                  output=str(target),
+                  quiet=False,
+                  use_cookies=False,
+                  remaining_ok=True,
+              )
+              if result is None:
+                  raise SystemExit(
+                      f"Could not download {folder_name}/. Check that the folder link is valid, "
+                      "set to Anyone with the link → Viewer, and accessible without sign-in."
+                  )
+              count = sum(1 for item in target.rglob("*") if item.is_file())
+              print(f"Downloaded {count} file(s) into {folder_name}/")
+              if count == 0:
+                  raise SystemExit(f"Google Drive folder {folder_name}/ downloaded no files.")
+
+          video_exts = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+          videos = [p for p in Path("download").rglob("*") if p.is_file() and p.suffix.lower() in video_exts]
+          print(f"Source video count: {len(videos)}")
+          if not videos:
+              raise SystemExit("Drive download folder contains no supported video files.")
+          PY
+          {
+            echo "## Google Drive source download"
+            echo "- Downloaded public assets folder into \`assets/\`."
+            echo "- Downloaded public source folder into \`download/\`."
+            echo "- These folders are used as temporary inputs in this runner; no report upload is configured."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install Python dependencies
         shell: bash
@@ -302,13 +362,13 @@ jobs:
                       records.append({"path": item.as_posix(), "size_bytes": size})
 
           manifest = {
-              "pipeline": "YT Auto Master Pipeline — Local Workspace Only",
+              "pipeline": "YT Auto Master Pipeline — Drive Input + Local Processing",
               "run_id": os.getenv("GITHUB_RUN_ID"),
               "run_number": os.getenv("GITHUB_RUN_NUMBER"),
               "repository": os.getenv("GITHUB_REPOSITORY"),
               "commit": os.getenv("GITHUB_SHA"),
               "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-              "storage_mode": "temporary GitHub-hosted runner workspace; no artifact or cloud upload",
+              "storage_mode": "public Google Drive source folders downloaded at runtime; processing and outputs stay in temporary runner workspace; no report or artifact upload",
               "stage_outcomes": {
                   "part_2": os.getenv("PART2_OUTCOME"),
                   "part_2_validation": os.getenv("PART2_VALIDATION"),
@@ -332,6 +392,7 @@ jobs:
             echo "- Part 2: ${PART2_OUTCOME:-not run} / validation: ${PART2_VALIDATION:-not run}"
             echo "- Part 3: ${PART3_OUTCOME:-not run} / validation: ${PART3_VALIDATION:-not run}"
             echo "- Part 4: ${PART4_OUTCOME:-not run} / validation: ${PART4_VALIDATION:-not run}"
-            echo "- Outputs are local to this runner and are not uploaded anywhere."
-            echo "- Important: GitHub-hosted runner storage is temporary and is deleted after the job ends."
+            echo "- Source inputs were downloaded from the public Drive folders into assets/ and download/."
+            echo "- No Google Sheets, Google Drive report upload, or GitHub artifact upload is configured."
+            echo "- Outputs stay in the runner workspace; GitHub-hosted runner storage is temporary and is deleted after the job ends."
           } >> "$GITHUB_STEP_SUMMARY"
