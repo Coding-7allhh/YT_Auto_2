@@ -1,0 +1,1 @@
+gdown>=5.2.0,<6\nnbformat>=5.9,<6\nnbconvert>=7.14,<8\nipykernel>=6.29,<7\n
