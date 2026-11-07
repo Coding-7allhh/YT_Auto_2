@@ -1,0 +1,2 @@
+Place source videos in subfolders here, for example download/gaming/video1.mp4.
+Commit only files that fit GitHub repository limits.
