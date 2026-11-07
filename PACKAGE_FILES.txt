@@ -1,8 +1,0 @@
-.github/workflows/yt-auto-master.yml	14750
-Part_2.ipynb	25255
-Part_3.ipynb	20133
-Part_4.ipynb	42228
-README.md	5194
-part3-requirements.txt	126
-part4-requirements.txt	159
-requirements.txt	75
