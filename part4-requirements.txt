@@ -1,8 +1,0 @@
-gspread>=6.1,<7
-google-auth>=2.35,<3
-google-api-python-client>=2.150,<3
-groq>=0.13,<1
-requests>=2.32,<3
-nbformat>=5.9,<6
-nbconvert>=7.14,<8
-ipykernel>=6.29,<7
