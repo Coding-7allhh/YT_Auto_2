@@ -1,6 +1,7 @@
 name: Part 3 - Process Part 2 Artifact
 
 on:
+ workflow_dispatch:
   workflow_run:
     workflows: ["Part 2 - Drive Download and Video Clips"]
     types: [completed]
