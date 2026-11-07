@@ -1,0 +1,11 @@
+.github/workflows/yt-auto-master.yml
+PACKAGE_FILES.txt
+Part_2.ipynb
+Part_3.ipynb
+Part_4.ipynb
+README.md
+assets/PUT_ASSETS_HERE.txt
+download/PUT_SOURCE_VIDEOS_HERE.txt
+part3-requirements.txt
+part4-requirements.txt
+requirements.txt
