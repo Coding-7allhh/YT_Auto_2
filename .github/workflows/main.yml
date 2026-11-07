@@ -1,0 +1,90 @@
+name: Part 2 - Drive Download and Video Clips
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: part2-video-processing-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  process-videos:
+    name: Download, test, and process videos
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      DRIVE_ASSETS_URL: ${{ secrets.DRIVE_ASSETS_URL }}
+      DRIVE_DOWNLOAD_URL: ${{ secrets.DRIVE_DOWNLOAD_URL }}
+      MAX_PARALLEL_VIDEOS: "2"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install FFmpeg and probe tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -n 2
+          ffprobe -version | head -n 1
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Validate configuration and notebook before running
+        run: |
+          python - <<'PY'
+          import os
+          import nbformat
+          from pathlib import Path
+
+          required = ("DRIVE_ASSETS_URL", "DRIVE_DOWNLOAD_URL")
+          missing = [name for name in required if not os.environ.get(name, "").strip()]
+          if missing:
+              raise SystemExit(
+                  "Missing GitHub Actions secrets: " + ", ".join(missing)
+                  + ". Add both under Settings > Secrets and variables > Actions."
+              )
+
+          notebook = nbformat.read("Part_2.ipynb", as_version=4)
+          nbformat.validate(notebook)
+          code_cells = [cell for cell in notebook.cells if cell.cell_type == "code"]
+          if not code_cells:
+              raise SystemExit("Part_2.ipynb contains no executable code cells.")
+          compile("\n\n".join(cell.source for cell in code_cells), "Part_2.ipynb", "exec")
+          print("✅ Notebook structure and Python syntax validated.")
+          PY
+
+      - name: Execute Part_2 notebook
+        run: |
+          mkdir -p executed
+          jupyter nbconvert \
+            --to notebook \
+            --execute Part_2.ipynb \
+            --output Part_2.executed.ipynb \
+            --output-dir executed \
+            --ExecutePreprocessor.timeout=-1 \
+            --ExecutePreprocessor.kernel_name=python3
+
+      - name: Upload generated clips and execution report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: part2-video-clips-${{ github.run_number }}
+          path: |
+            clips/**
+            executed/Part_2.executed.ipynb
+          if-no-files-found: warn
+          retention-days: 7
