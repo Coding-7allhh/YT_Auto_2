@@ -142,8 +142,6 @@ jobs:
           required = [
               "DRIVE_ASSETS_URL",
               "DRIVE_DOWNLOAD_URL",
-              "GOOGLE_SERVICE_ACCOUNT_JSON",
-              "GOOGLE_DRIVE_REPORTS_FOLDER_ID",
           ]
           missing = [name for name in required if not os.environ.get(name, "").strip()]
           if missing:
