@@ -396,3 +396,27 @@ jobs:
             echo "- No Google Sheets, Google Drive report upload, or GitHub artifact upload is configured."
             echo "- Outputs stay in the runner workspace; GitHub-hosted runner storage is temporary and is deleted after the job ends."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      
+      - name: Upload Complete Pipeline Data (7 Days)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: YT-Auto-Complete-Output-${{ github.run_number }}
+          path: |
+            download/
+            assets/
+            clips/
+            Ready_!/
+            Part_4_Output/
+            logs/
+            executed/
+            *.ipynb
+            *.json
+            *.csv
+            *.txt
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+          include-hidden-files: true
+          
