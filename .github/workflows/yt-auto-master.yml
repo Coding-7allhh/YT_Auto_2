@@ -289,7 +289,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          count=$(find "Ready_!" -type f \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.avi' -o -iname '*.mkv' \) | wc -l)
+          count=$(find "clips" -type f \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.avi' -o -iname '*.mkv' \) | wc -l)
           echo "Part 3 processed video count: $count"
           echo "Part 3 processed video count: **$count**" >> "$GITHUB_STEP_SUMMARY"
           if [[ "$count" -eq 0 ]]; then
