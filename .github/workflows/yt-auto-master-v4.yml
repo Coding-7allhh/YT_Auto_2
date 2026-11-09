@@ -1,0 +1,437 @@
+name: YT Auto Master Pipeline V4 — Discord + Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_parallel_videos:
+        description: "Part 2 parallel video workers. Use 1 for lower memory usage."
+        type: choice
+        required: true
+        default: "1"
+        options:
+          - "1"
+          - "2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yt-auto-discord-v4-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run-all-parts:
+    name: Run Part 2, Part 3, Part 4, and Discord uploads
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    environment:
+      name: yt-auto-discord
+      deployment: false
+
+    env:
+      # These flags disable Google report/sheet/upload integrations; source folders are fetched by the workflow step above.
+      LOCAL_ONLY_MODE: "1"
+      DISABLE_CLOUD_STORAGE: "1"
+      DISABLE_GOOGLE_INTEGRATIONS: "1"
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      DISCORD_MAX_FILE_MB: "25"
+      DISCORD_THREAD_ID: ${{ secrets.DISCORD_THREAD_ID }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # Public Google Drive folder links stored as GitHub Actions secrets.
+      DRIVE_ASSETS_URL: ${{ secrets.DRIVE_ASSETS_URL }}
+      DRIVE_DOWNLOAD_URL: ${{ secrets.DRIVE_DOWNLOAD_URL }}
+      MAX_PARALLEL_VIDEOS: ${{ inputs.max_parallel_videos }}
+      SCHEDULE_TIMEZONE: Asia/Karachi
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          clean: true
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            part3-requirements.txt
+            part4-requirements.txt
+
+      - name: Install FFmpeg and fonts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
+          ffmpeg -version | head -n 2
+          ffprobe -version | head -n 1
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Prepare clean workspace
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf download assets clips "Ready_!" Part_4_Output executed logs local_notebooks run_manifest.json
+          mkdir -p download assets clips "Ready_!" Part_4_Output executed logs local_notebooks
+          printf 'Pipeline started at %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > logs/pipeline.log
+
+      - name: Install Google Drive folder downloader
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --disable-pip-version-check 'gdown>=5.2,<6'
+
+      - name: Download public Drive folders (assets and download)
+        id: drive_download
+        shell: bash
+        env:
+          DRIVE_ASSETS_URL: ${{ secrets.DRIVE_ASSETS_URL }}
+          DRIVE_DOWNLOAD_URL: ${{ secrets.DRIVE_DOWNLOAD_URL }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "${DRIVE_ASSETS_URL:-}" ]]; then
+            echo "::error::Missing GitHub Secret DRIVE_ASSETS_URL (publicly shared assets folder link)."
+            exit 1
+          fi
+          if [[ -z "${DRIVE_DOWNLOAD_URL:-}" ]]; then
+            echo "::error::Missing GitHub Secret DRIVE_DOWNLOAD_URL (publicly shared source-video folder link)."
+            exit 1
+          fi
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import gdown
+
+          folders = [
+              ("assets", os.environ["DRIVE_ASSETS_URL"]),
+              ("download", os.environ["DRIVE_DOWNLOAD_URL"]),
+          ]
+          for folder_name, url in folders:
+              target = Path(folder_name)
+              target.mkdir(parents=True, exist_ok=True)
+              print(f"Downloading Google Drive folder: {folder_name}/")
+              result = gdown.download_folder(
+                  url=url,
+                  output=str(target),
+                  quiet=False,
+                  use_cookies=False,
+                  remaining_ok=True,
+              )
+              if result is None:
+                  raise SystemExit(
+                      f"Could not download {folder_name}/. Check that the folder link is valid, "
+                      "set to Anyone with the link → Viewer, and accessible without sign-in."
+                  )
+              count = sum(1 for item in target.rglob("*") if item.is_file())
+              print(f"Downloaded {count} file(s) into {folder_name}/")
+              if count == 0:
+                  raise SystemExit(f"Google Drive folder {folder_name}/ downloaded no files.")
+
+          video_exts = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+          videos = [p for p in Path("download").rglob("*") if p.is_file() and p.suffix.lower() in video_exts]
+          print(f"Source video count: {len(videos)}")
+          if not videos:
+              raise SystemExit("Drive download folder contains no supported video files.")
+          PY
+          {
+            echo "## Google Drive source download"
+            echo "- Downloaded public assets folder into \`assets/\`."
+            echo "- Downloaded public source folder into \`download/\`."
+            echo "- These folders are used as temporary inputs in this runner; no report upload is configured."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --upgrade pip
+          for req in requirements.txt part3-requirements.txt part4-requirements.txt; do
+            if [[ -f "$req" ]]; then
+              python -m pip install -r "$req"
+            fi
+          done
+          python -m pip check
+
+      - name: Validate notebooks and automatically skip cloud-integration cells
+        id: local_preflight
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import nbformat
+          from IPython.core.interactiveshell import InteractiveShell
+
+          if not (os.getenv("OPENROUTER_API_KEY", "").strip()
+                  or os.getenv("GROQ_API_KEY", "").strip()):
+              raise SystemExit("Add at least one AI secret: OPENROUTER_API_KEY or GROQ_API_KEY.")
+          if not os.getenv("DISCORD_WEBHOOK_URL", "").strip():
+              raise SystemExit("Add the GitHub Actions Secret DISCORD_WEBHOOK_URL.")
+
+          source_files = ("Part_2.ipynb", "Part_3_v2.ipynb", "Part_4_v2.ipynb")
+          # V2 wrappers patch the original notebooks in memory, so fail early
+          # with a clear message if either original dependency was removed.
+          for dependency in ("Part_3.ipynb", "Part_4.ipynb"):
+              if not Path(dependency).is_file():
+                  raise SystemExit(f"Required original notebook is missing: {dependency}. Keep originals beside the V2 wrappers.")
+          output_dir = Path("local_notebooks")
+          output_dir.mkdir(exist_ok=True)
+
+          # Any code cell containing one of these integration identifiers is
+          # skipped as a whole. This prevents missing Google credentials from
+          # stopping the workflow. Keep local processing in separate cells.
+          cloud_markers = (
+              "GOOGLE_SERVICE_ACCOUNT_JSON",
+              "GOOGLE_DRIVE_REPORTS_FOLDER_ID",
+              "google.oauth2",
+              "googleapiclient",
+              "googleapiclient.discovery",
+              "gspread",
+              "drive.google.com",
+              "googleapis.com/drive",
+              "sheets.googleapis.com",
+              "google drive",
+              "google sheets",
+              "google.colab import drive",
+              "from google.colab import drive",
+              "spreadsheets().",
+              "worksheet(",
+              "drive.files().",
+          )
+
+          shell = InteractiveShell.instance()
+          total_skipped = 0
+          for filename in source_files:
+              path = Path(filename)
+              if not path.is_file():
+                  raise SystemExit(f"Required notebook is missing: {filename}")
+
+              notebook = nbformat.read(path, as_version=4)
+              nbformat.validate(notebook)
+              kept_cells = []
+              skipped_here = 0
+
+              for cell in notebook.cells:
+                  if cell.cell_type == "code":
+                      source_lower = cell.source.casefold()
+                      matches = [marker for marker in cloud_markers if marker.casefold() in source_lower]
+                      # Keep V2 processing cells intact; they contain mixed setup and local processing.
+                      if filename in ("Part_3_v2.ipynb", "Part_4_v2.ipynb"):
+                          matches = []
+                      if matches:
+                          skipped_here += 1
+                          total_skipped += 1
+                          print(
+                              f"AUTO-SKIP {filename} cell {cell.get('execution_count', 'n/a')}: "
+                              f"cloud integration marker(s): {', '.join(matches)}"
+                          )
+                          continue
+                  kept_cells.append(cell)
+
+              notebook.cells = kept_cells
+              nbformat.validate(notebook)
+
+              # Syntax-check each remaining cell after translating notebook
+              # magics (for example, %cd and ! commands) into Python calls.
+              for index, cell in enumerate(notebook.cells, start=1):
+                  if cell.cell_type == "code" and cell.source.strip():
+                      transformed = shell.transform_cell(cell.source)
+                      compile(transformed, f"{filename}:cell-{index}", "exec")
+
+              output_path = output_dir / filename.replace(".ipynb", ".local.ipynb")
+              nbformat.write(notebook, output_path)
+              print(f"Prepared {filename}: skipped {skipped_here} cloud cell(s); saved {output_path}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"skipped_cells={total_skipped}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n## Local-only preflight\n")
+              summary.write("- Google Drive / Google Sheets integration cells are disabled.\n")
+              summary.write(f"- Cloud-integration notebook code cells skipped: {total_skipped}.\n")
+          print(f"Total cloud-integration code cells automatically skipped: {total_skipped}")
+          PY
+
+      # ---------------------------- PART 2 ----------------------------
+      - name: "PART 2 — Process local inputs and create clips"
+        id: part2
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m jupyter nbconvert --to notebook --execute local_notebooks/Part_2.local.ipynb \
+            --output Part_2.executed.ipynb \
+            --output-dir executed \
+            --ExecutePreprocessor.timeout=-1 \
+            --ExecutePreprocessor.kernel_name=python3 \
+            2>&1 | tee logs/Part_2.log
+
+      - name: Validate Part 2 output
+        id: validate_part2
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          count=$(find clips -type f -iname '*.mp4' | wc -l)
+          echo "Part 2 MP4 count: $count"
+          echo "Part 2 MP4 count: **$count**" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$count" -eq 0 ]]; then
+            echo "::error::Part 2 produced no MP4 files under clips/. Check the local input layout and skipped cells in logs/Part_2.log."
+            find download -maxdepth 5 -type f | head -n 100 || true
+            exit 1
+          fi
+
+      # ---------------------------- PART 3 ----------------------------
+      - name: "PART 3 — Edit clips into Ready_!"
+        id: part3
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m jupyter nbconvert --to notebook --execute local_notebooks/Part_3_v2.local.ipynb \
+            --output Part_3.executed.ipynb \
+            --output-dir executed \
+            --ExecutePreprocessor.timeout=-1 \
+            --ExecutePreprocessor.kernel_name=python3 \
+            2>&1 | tee logs/Part_3.log
+
+      - name: Validate Part 3 output
+        id: validate_part3
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          count=$(find "Ready_!" -type f \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.avi' -o -iname '*.mkv' \) -size +0c | wc -l)
+          echo "Part 3 output video count in Ready_!: $count"
+          echo "Part 3 output video count in Ready_!: **$count**" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$count" -eq 0 ]]; then
+            echo "::error::Part 3 produced no supported, non-empty videos under Ready_!. Check the local input paths and logs/Part_3.log."
+            find "Ready_!" -maxdepth 5 -type f | head -n 100 || true
+            exit 1
+          fi
+
+      # ---------------------------- PART 4 ----------------------------
+      - name: "PART 4 — Generate metadata and reports locally"
+        id: part4
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m jupyter nbconvert --to notebook --execute local_notebooks/Part_4_v2.local.ipynb \
+            --output Part_4.executed.ipynb \
+            --output-dir executed \
+            --ExecutePreprocessor.timeout=-1 \
+            --ExecutePreprocessor.kernel_name=python3 \
+            2>&1 | tee logs/Part_4.log
+
+      - name: Validate Part 4 local outputs
+        id: validate_part4
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ ! -s Part_4_Output/metadata_rows.csv ]]; then
+            echo "::error::Part 4 did not create Part_4_Output/metadata_rows.csv. A skipped Google cell may contain mixed local metadata code; separate local report generation from Google upload code in Part_4.ipynb."
+            exit 1
+          fi
+          if [[ ! -s Part_4_Output/run_summary.json ]]; then
+            echo "::error::Part 4 did not create Part_4_Output/run_summary.json. Check Part_4_v2.ipynb and logs/Part_4.log."
+            exit 1
+          fi
+          python -m json.tool Part_4_Output/run_summary.json >/dev/null
+          echo "Part 4 local CSV and JSON outputs validated." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create local run manifest and job summary
+        if: always()
+        shell: bash
+        env:
+          PART2_OUTCOME: ${{ steps.part2.outcome }}
+          PART3_OUTCOME: ${{ steps.part3.outcome }}
+          PART4_OUTCOME: ${{ steps.part4.outcome }}
+          PART2_VALIDATION: ${{ steps.validate_part2.outcome }}
+          PART3_VALIDATION: ${{ steps.validate_part3.outcome }}
+          PART4_VALIDATION: ${{ steps.validate_part4.outcome }}
+        run: |
+          set -Eeuo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          roots = ["download", "assets", "clips", "Ready_!", "Part_4_Output", "executed", "logs", "local_notebooks"]
+          records = []
+          total_bytes = 0
+          for root in roots:
+              base = Path(root)
+              if not base.exists():
+                  continue
+              for item in sorted(base.rglob("*")):
+                  if item.is_file():
+                      try:
+                          size = item.stat().st_size
+                      except OSError:
+                          continue
+                      total_bytes += size
+                      records.append({"path": item.as_posix(), "size_bytes": size})
+
+          manifest = {
+              "pipeline": "YT Auto Master Pipeline V4 — Discord + Environment",
+              "run_id": os.getenv("GITHUB_RUN_ID"),
+              "run_number": os.getenv("GITHUB_RUN_NUMBER"),
+              "repository": os.getenv("GITHUB_REPOSITORY"),
+              "commit": os.getenv("GITHUB_SHA"),
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "storage_mode": "public Google Drive source folders downloaded at runtime; GitHub Actions artifact retained for 7 days; runner workspace is temporary",
+              "stage_outcomes": {
+                  "part_2": os.getenv("PART2_OUTCOME"),
+                  "part_2_validation": os.getenv("PART2_VALIDATION"),
+                  "part_3": os.getenv("PART3_OUTCOME"),
+                  "part_3_validation": os.getenv("PART3_VALIDATION"),
+                  "part_4": os.getenv("PART4_OUTCOME"),
+                  "part_4_validation": os.getenv("PART4_VALIDATION"),
+              },
+              "file_count": len(records),
+              "total_file_bytes": total_bytes,
+              "files": records,
+          }
+          Path("run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+          print(f"Local manifest created: {len(records)} files, {total_bytes:,} bytes")
+          PY
+
+          {
+            echo ""
+            echo "## YT Auto — Local Workspace Run"
+            echo "- Run: $GITHUB_RUN_NUMBER (attempt $GITHUB_RUN_ATTEMPT)"
+            echo "- Part 2: ${PART2_OUTCOME:-not run} / validation: ${PART2_VALIDATION:-not run}"
+            echo "- Part 3: ${PART3_OUTCOME:-not run} / validation: ${PART3_VALIDATION:-not run}"
+            echo "- Part 4: ${PART4_OUTCOME:-not run} / validation: ${PART4_VALIDATION:-not run}"
+            echo "- Source inputs were downloaded from the public Drive folders into assets/ and download/."
+            echo "- No Google Sheets or Google Drive report upload is configured."
+            echo "- A GitHub Actions artifact containing outputs and logs is retained for 7 days."
+            echo "- The runner workspace is temporary; download the artifact before its retention period ends."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      
+      - name: Upload Complete Pipeline Data (7 Days)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: YT-Auto-Complete-Output-${{ github.run_number }}
+          path: |
+            download/
+            assets/
+            clips/
+            Ready_!/
+            Part_4_Output/
+            logs/
+            executed/
+            *.ipynb
+            *.json
+            *.csv
+            *.txt
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+          include-hidden-files: true
