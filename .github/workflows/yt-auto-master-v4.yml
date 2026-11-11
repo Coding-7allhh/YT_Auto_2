@@ -420,17 +420,8 @@ jobs:
         with:
           name: YT-Auto-Complete-Output-${{ github.run_number }}
           path: |
-            download/
-            assets/
-            clips/
             Ready_!/
             Part_4_Output/
-            logs/
-            executed/
-            *.ipynb
-            *.json
-            *.csv
-            *.txt
           if-no-files-found: warn
           retention-days: 7
           compression-level: 0
